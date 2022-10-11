@@ -3904,7 +3904,7 @@ class Pipeline:
         spec: np.ndarray,
         wavel: np.ndarray,
         telluric_template: np.ndarray,
-        accuracy: float = 0.01,
+        accuracy: float = 0.002,
         window_length : int = 101
     ) -> tuple([np.ndarray, float, float]):
 
@@ -3963,7 +3963,7 @@ class Pipeline:
     def correct_wavelengths(
         self,
         nod_ab: str = "A",
-        accuracy: float = 0.01,
+        accuracy: float = 0.002,
         window_length: int = 201,
         minimum_strength: float = 0.005,
         create_plots: bool = False,
@@ -4125,7 +4125,7 @@ class Pipeline:
     def correct_wavelengths_2d(
         self,
         nod_ab: str = "A",
-        accuracy: float = 0.01,
+        accuracy: float = 0.002,
         window_length: int = 201,
         minimum_strength: float = 0.005,
         sum_over_spatial_dim: bool = True,
