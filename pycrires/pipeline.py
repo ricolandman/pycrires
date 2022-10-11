@@ -12,7 +12,7 @@ import subprocess
 import sys
 import urllib.request
 import warnings
-
+import time as tme
 from typing import Optional, Tuple
 
 import numpy as np
@@ -3905,7 +3905,7 @@ class Pipeline:
         wavel: np.ndarray,
         telluric_template: np.ndarray,
         accuracy: float = 0.01,
-        window_length : int = 201
+        window_length : int = 101
     ) -> tuple([np.ndarray, float, float]):
 
         template_interp = interpolate.interp1d(
@@ -3916,28 +3916,32 @@ class Pipeline:
         # Remove continuum and nans of spectra.
         # The continuum is estimated by smoothing the
         # spectrum with a 2nd order Savitzky-Golay filter
-        nans = np.isnan(spec)
+        spec = spec[10:-10]
+        wavel = wavel[10:-10]
+        nans = np.isnan(spec) + (spec<0.1*np.nanmedian(spec))
         continuum = signal.savgol_filter(
             spec[~nans], window_length=window_length,
             polyorder=2, mode='interp')
         
-        # Add 1 to continuum for bins where there is no flux
-        spec_flat = spec[~nans]/(continuum + 1) - 1.
+        spec_flat = spec[~nans] - continuum
+        outliers = np.abs(spec_flat)>(5*np.nanstd(spec))
+        spec_flat[outliers]=0
 
         # Don't use the edges as that sometimes gives problems
-        spec_flat = spec_flat[20:-20]
-        used_wavel = wavel[~nans][20:-20]
+        spec_flat = spec_flat[10:-10]
+        used_wavel = wavel[~nans][10:-10]
 
         # Prepare cross-correlation grid
         dlam = (wavel[-1]-np.mean(wavel))/2
         da = accuracy/dlam
-        N_a = int(np.ceil(0.1 / da) // 2 * 2 + 1)
-        N_b = int(np.ceil(0.6 / accuracy) // 2 * 2 + 1)
+        N_a = int(np.ceil(0.04 / da) // 2 * 2 + 1)
+        N_b = int(np.ceil(1.0 / accuracy) // 2 * 2 + 1)
 
         a_grid = np.linspace(
-            0.95, 1.05, N_a)[:, np.newaxis, np.newaxis]
+            0.98, 1.02, N_a)[:, np.newaxis, np.newaxis]
         b_grid = np.linspace(
-            -0.3, 0.3, N_b)[np.newaxis, :, np.newaxis]
+            -0.5, 0.5, N_b)[np.newaxis, :, np.newaxis]
+
         mean_wavel = np.mean(wavel)
         wl_matrix = a_grid * (used_wavel[np.newaxis, np.newaxis, :]
                             - mean_wavel) + mean_wavel + b_grid
@@ -3952,7 +3956,8 @@ class Pipeline:
             np.argmax(cross_corr), cross_corr.shape)
         opt_a = a_grid[opt_idx[0], 0, 0]
         opt_b = b_grid[0, opt_idx[1], 0]
-        return cross_corr, opt_a, opt_b
+        return  [opt_b, opt_a]
+
 
     @typechecked
     def correct_wavelengths(
@@ -4124,6 +4129,7 @@ class Pipeline:
         window_length: int = 201,
         minimum_strength: float = 0.005,
         sum_over_spatial_dim: bool = True,
+        sum_over_time: bool = True,
         input_folder = 'fit_gaussian'
     ) -> None:
         """
@@ -4163,6 +4169,10 @@ class Pipeline:
             improving the S/N of the spectra. However, this may 
             result in slight errors in the wavelength solution
             off-axis.
+        sum_over_time: bool
+            If True, the wavelength correction will be calculated
+            using the summed spectra over all exposures,
+            improving the S/N of the spectra.
         Returns
         -------
         NoneType
@@ -4195,8 +4205,17 @@ class Pipeline:
             fits_files = list(self.file_dict[f'UTIL_EXTRACT_2D_{nod_ab}'].keys())
         elif input_folder=='fit_gaussian':
             fits_files = list(self.file_dict[f'FIT_GAUSSIAN_2D_{nod_ab}'].keys())
+            
+        if sum_over_time:
+            tot_flux = 0
+            normalization = 0
+            for fits_file in fits_files:
+                hdu_list = fits.open(fits_file)
+                tot_flux += hdu_list['SPEC'].data/(hdu_list['ERR'].data + 1)**2
+                normalization += 1/(hdu_list['ERR'].data + 1)**2
+            tot_flux = tot_flux/normalization
 
-        for fits_file in fits_files:
+        for file_i, fits_file in enumerate(fits_files):
 
             print(f"\nReading spectra from {fits_file}...", end="", flush=True)
 
@@ -4204,6 +4223,7 @@ class Pipeline:
             corrected_wavel = hdu_list['WAVE'].data[:,:,:,:]
 
             print(" [DONE]")
+
 
             for det_idx in range(3):
                 # Get detector data
@@ -4213,12 +4233,16 @@ class Pipeline:
                 for order_idx in np.arange(7):
                     # Extract WL and SPEC for given order/detector
                     wavel_2d = hdu_list['WAVE'].data[det_idx, order_idx]
-                    spec_2d = hdu_list['SPEC'].data[det_idx, order_idx]
+                    if not sum_over_time:
+                        spec_2d = hdu_list['SPEC'].data[det_idx, order_idx]
+                    else:
+                        spec_2d = tot_flux[det_idx, order_idx]
 
                     # If we sum over the spatial dimension to boost SNR, do so
                     if sum_over_spatial_dim:
+                        cent_idx = spec_2d.shape[0]//2+1
                         wavel_list = [np.nanmean(wavel_2d,axis=0)]
-                        spec_list = [np.nansum(spec_2d, axis=0)]
+                        spec_list = [np.nansum(spec_2d[cent_idx-5:cent_idx+5], axis=0)]
                     else:
                         wavel_list = np.copy(wavel_2d)
                         spec_list = np.copy(spec_2d)
@@ -4238,23 +4262,24 @@ class Pipeline:
                         for row, (spec, wavel) in enumerate(zip(spec_list, wavel_list)):
 
                             #Calculate wavelength solution using cross-correlation
-                            cross_corr, opt_a, opt_b = self.xcor_wavelength_solution(
+                            opt_p = self.xcor_wavelength_solution(
                                 spec, wavel, transm_spec, accuracy, window_length)
 
                             print(
-                                f"   - Detector {det_idx+1}, Order {order_idx}, Row {row} -> lambda = {opt_b:.4f} "
-                                f"+ {opt_a:.4f} * lambda'"
+                                f"   - Detector {det_idx+1}, Order {order_idx}, Row {row} -> lambda = {opt_p[0]:.4f} "
+                                f"+ {opt_p[1]:.4f} * lambda'"
                             )
 
                             mean_wavel = np.mean(wavel)
+                            dwavel = wavel - mean_wavel
                             # Save new wavelength solution
                             if sum_over_spatial_dim:
                                 corrected_wavel[det_idx, order_idx, :] = (
-                                    opt_a*(wavel-mean_wavel) + mean_wavel + opt_b
+                                    mean_wavel + opt_p[0] + opt_p[1] * dwavel
                                 )
                             else:
                                 corrected_wavel[det_idx, order_idx, row] = (
-                                    opt_a*(wavel-mean_wavel) + mean_wavel + opt_b
+                                    mean_wavel + opt_p[0] + opt_p[1] * dwavel
                                 )
 
             # Add corrected wavelengths tCORR_WAVE' in o existing fits file
@@ -4465,7 +4490,6 @@ class Pipeline:
 
                 os.remove(file_name)
     
-    @typechecked
     def custom_extract_2d(
         self,
         nod_ab: str = 'A',
@@ -4548,6 +4572,7 @@ class Pipeline:
             flux_2d = np.zeros((3, num_orders, n_points, 2048))
             errors_2d = np.zeros((3, num_orders, n_points, 2048))
             wavelengths = np.zeros((3, num_orders, n_points, 2048))
+            start = tme.time()
 
             for det_idx in np.arange(3):
                 print('Detector:', det_idx)
@@ -4566,8 +4591,19 @@ class Pipeline:
                     slit_fraction_dy = upper_idx - lower_idx
                     dy = extraction_ratio * slit_fraction_dy
 
-                    #Make symmetric sampling around star position
+                    # Make symmetric sampling around star position
                     y0s = np.linspace(cent_idx - dy / 2, cent_idx + dy / 2, n_points)
+
+                    # Get polynomial coefficients for slit tilt
+                    tilt_p0 = trace_data['SlitPolyA'][order_idx, 0] + \
+                              trace_data['SlitPolyA'][order_idx, 1] * xs + \
+                              trace_data['SlitPolyA'][order_idx, 2] * xs**2
+                    tilt_p1 = trace_data['SlitPolyB'][order_idx, 0] +  \
+                              trace_data['SlitPolyB'][order_idx, 1] * xs + \
+                              trace_data['SlitPolyB'][order_idx, 2] * xs**2
+                    tilt_p2 = trace_data['SlitPolyC'][order_idx, 0] + \
+                              trace_data['SlitPolyC'][order_idx, 1] * xs + \
+                              trace_data['SlitPolyC'][order_idx, 2] * xs**2
 
                     # Loop over spatial positions to extract
                     for pos_idx, y0 in enumerate(y0s):
@@ -4591,13 +4627,18 @@ class Pipeline:
                             frac = (cent_idx - y0) /  y0
                             ys = frac * y_low + (1 - frac) * y_mid
 
-                        #Interpolate the spectrum and error for the new coordinates
+                        # Correct for the slit curvature
                         new_spec = [interp1d(Y, image[:,x-1], fill_value=0, 
                                     bounds_error=False)(y) for (x,y) 
                                     in zip(xs, ys)]
                         new_err = [interp1d(Y, errors[:,x-1], fill_value=0, 
                                     bounds_error=False)(y) for (x,y) 
                                     in zip(xs, ys)]
+
+                        # Correct for the slit tilt
+                        new_xs = tilt_p0 + tilt_p1 * y0 + tilt_p2 * y0**2
+                        new_spec = interp1d(xs, new_spec, fill_value=np.nan,
+                                            bounds_error=False)(new_xs)
 
                         #Calculate the wavelength solution from the EsoRex data
                         new_waves = trace_data['Wavelength'][order_idx, 0] + \
@@ -4618,13 +4659,14 @@ class Pipeline:
             result_hdu.append(fits.ImageHDU(errors_2d, name='ERR'))
             result_hdu.append(fits.ImageHDU(wavelengths, name='WAVE'))
             result_hdu.writeto(fits_out, overwrite=True)
+            print(f'Took: {tme.time()-start:.2f} seconds')
 
             print(f'--> Done! Results written to {fits_out.stem}')
             self._update_files(f"CUSTOM_EXTRACT_2D_{nod_ab}", str(fits_out))
 
             with open(self.json_file, "w", encoding="utf-8") as json_file:
                 json.dump(self.file_dict, json_file, indent=4)
-
+    
     @typechecked
     def fit_gaussian(self, nod_ab: str = "A", extraction_input: str = 'util_extract_2d') -> None:
         """
@@ -4657,7 +4699,7 @@ class Pipeline:
         # List with FITS files that will be processed
 
         input_folder = self.product_folder / extraction_input 
-        fits_files = pathlib.Path(input_folder).glob(f"cr2res_combined{nod_ab}_*_extr2d.fits")
+        fits_files = sorted(pathlib.Path(input_folder).glob(f"cr2res_combined{nod_ab}_*_extr2d.fits"))
         n_exp = len(list(pathlib.Path(input_folder).glob(f"cr2res_combined{nod_ab}_*_extr2d.fits")))
 
         print_msg = ""
@@ -4673,6 +4715,7 @@ class Pipeline:
 
             with fits.open(fits_item) as hdu_list:
                 spec = np.array(hdu_list[1].data)
+                spec[np.isnan(spec)] = 0
                 err = np.array(hdu_list[2].data)
                 wave = np.array(hdu_list[3].data)
 
@@ -4689,7 +4732,8 @@ class Pipeline:
             for det_idx in range(spec.shape[0]):
                 for order_idx in range(spec.shape[1]):
                     spec_select = spec[det_idx, order_idx, :, :]
-                    y_data = np.median(spec_select, axis=1)
+                    tot_spec = np.nansum(spec_select, axis=-1)
+                    y_data = np.nanmedian(spec_select, axis=1)
 
                     if y_data.shape[0]%2 == 0:
                         x_data = np.linspace(-y_data.shape[0]//2+0.5,
@@ -4700,7 +4744,7 @@ class Pipeline:
                         x_data = np.linspace(-(y_data.shape[0]-1)//2,
                                              (y_data.shape[0]-1)//2,
                                              y_data.shape[0])
-
+                    peak_I = x_data[np.argmax(tot_spec)]
                     # if np.count_nonzero(y_data) == 0:
                     #     spec_shift[det_idx, order_idx, :, :] = \
                     #         np.full(y_data.shape[0], np.nan)
@@ -4708,7 +4752,7 @@ class Pipeline:
                     #     continue
 
                     try:
-                        guess = (np.amax(y_data), 0., 1.)
+                        guess = (np.amax(y_data), peak_I, 1.)
                         nans = np.isnan(y_data)
                         y_data[nans] = 0
                         result, _ = optimize.curve_fit(gaussian, x_data, y_data, p0=guess)
@@ -4725,6 +4769,7 @@ class Pipeline:
                         spec_shift[det_idx, order_idx, :, :] = \
                             ndimage.shift(spec_select, (-result[1], 0.),
                                           order=3, mode='constant')
+                        print(det_idx, order_idx, result[1])
 
                         gauss_amp[det_idx, order_idx] = result[0]
                         gauss_mean[det_idx, order_idx] = result[1]
