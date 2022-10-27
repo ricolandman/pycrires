@@ -3996,7 +3996,8 @@ class Pipeline:
         wavel: np.ndarray,
         telluric_template: np.ndarray,
         accuracy: float = 0.002,
-        window_length : int = 101
+        window_length : int = 101,
+        return_cross_corr: bool = False
     ) -> tuple([np.ndarray, float, float]):
 
         template_interp = interpolate.interp1d(
@@ -4047,7 +4048,10 @@ class Pipeline:
             np.argmax(cross_corr), cross_corr.shape)
         opt_a = a_grid[opt_idx[0], 0, 0]
         opt_b = b_grid[0, opt_idx[1], 0]
-        return  [opt_b, opt_a]
+        if return_cross_corr:
+            return  cross_corr, (opt_b, opt_a)
+        else:
+            return (opt_b, opt_a)
 
     @typechecked
     def correct_wavelengths(
@@ -4165,8 +4169,8 @@ class Pipeline:
                     if template_std > minimum_strength:
                         # Calculate the cross-correlation
                         # between data and template
-                        cross_corr, opt_a, opt_b = self.xcor_wavelength_solution(
-                            spec, wavel, transm_spec, accuracy, window_length
+                        cross_corr, (opt_b, opt_a) = self.xcor_wavelength_solution(
+                            spec, wavel, transm_spec, accuracy, window_length, return_cross_corr=True
                         )
 
                         # Plot correlation map
@@ -4175,7 +4179,7 @@ class Pipeline:
                             plt.title(f"Detector {i_det+1}, order {order}")
                             plt.imshow(
                                 cross_corr,
-                                extent=[-0.3, 0.3, 0.98, 1.02],
+                                extent=[-0.5, 0.5, 0.98, 1.02],
                                 origin="lower",
                                 aspect="auto",
                             )
