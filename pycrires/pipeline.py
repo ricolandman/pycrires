@@ -4515,7 +4515,7 @@ class Pipeline:
 
             # Prepare SOF file
             sof_file = pathlib.Path(
-                self.product_folder / "util_extract_2d" / f"files_{count_exp:03d}.sof"
+                self.product_folder / "util_extract_science" / f"files_{count_exp:03d}.sof"
             )
             with open(sof_file, "w", encoding="utf-8") as sof_open:
                 sof_open.write(f"{fits_file} OBS_NODDING_OTHER\n")
@@ -4530,7 +4530,7 @@ class Pipeline:
                 file_name = str(tw_file).split("/")[-2:]
                 print(f"   - product/{file_name[-2]}/{file_name[-1]} UTIL_WAVE_TW\n")
 
-            config_file = self.config_folder / "util_extract_2d.rc"
+            config_file = self.config_folder / "util_extract_science.rc"
 
             esorex = [
                 "esorex",
