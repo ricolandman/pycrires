@@ -4030,9 +4030,9 @@ class Pipeline:
         N_b = int(np.ceil(1.0 / accuracy) // 2 * 2 + 1)
 
         a_grid = np.linspace(
-            0.98, 1.02, N_a)[:, np.newaxis, np.newaxis]
+            0.99, 1.01, N_a)[:, np.newaxis, np.newaxis]
         b_grid = np.linspace(
-            -0.5, 0.5, N_b)[np.newaxis, :, np.newaxis]
+            -0.3, 0.3, N_b)[np.newaxis, :, np.newaxis]
 
         mean_wavel = np.mean(wavel)
         wl_matrix = a_grid * (used_wavel[np.newaxis, np.newaxis, :]
@@ -4061,6 +4061,7 @@ class Pipeline:
         accuracy: float = 0.002,
         window_length: int = 201,
         minimum_strength: float = 0.005,
+        sum_over_time: bool = False,
         create_plots: bool = False,
     ) -> None:
         """
@@ -4127,11 +4128,22 @@ class Pipeline:
         # Read extracted spectra
         if input_folder == "obs_nodding":
             fits_files = list(self.file_dict[f"OBS_NODDING_EXTRACT{nod_ab}"].keys())
+            import glob
+            fits_files = glob.glob(f'/users/ricolandman/Research_data/crires_hd209458/product/obs_nodding/cr2res_obs_nodding_extracted{nod_ab}_*.fits')
+            print(fits_files)
 
         elif input_folder == "util_extract_science":
             fits_files = list(self.file_dict[f"UTIL_EXTRACT_SCIENCE_{nod_ab}"].keys())
+        
 
-        for fits_file in fits_files:
+        # Hacky way to only do the wavelength solution once
+        # when sum_over_time = True
+        if sum_over_time:
+            N_files = 1
+        else:
+            N_files = len(fits_files)+1
+
+        for fits_file in fits_files[:N_files]:
 
             print(f"\nReading spectra from {fits_file}...", end="", flush=True)
 
@@ -4140,8 +4152,11 @@ class Pipeline:
             print(" [DONE]")
 
             if create_plots:
+                data = hdu_list[f"CHIP1.INT1"].data
+                spec_orders = np.sort([i[:5] for i in data.dtype.names if "WL" in i])
+                N_orders = len(spec_orders)
                 fig, axes = plt.subplots(
-                    7, 3, figsize=(9, 15), sharex=True, sharey=True
+                    N_orders, 3, figsize=(9, 15), sharex=True, sharey=True
                 )
 
             for i_det in range(3):
@@ -4157,8 +4172,6 @@ class Pipeline:
                 for order, spec_name in enumerate(spec_orders):
                     # Extract WL, SPEC, and ERR for given order/detector
                     wavel = hdu_list[f"CHIP{i_det+1}.INT1"].data[spec_name + "_WL"]
-                    spec = hdu_list[f"CHIP{i_det+1}.INT1"].data[spec_name + "_SPEC"]
-                    # err = hdu_list[f"CHIP{i_det+1}.INT1"].data[spec_name + "_ERR"]
 
                     # Check if there are enough telluric
                     # features in this wavelength range
@@ -4167,11 +4180,47 @@ class Pipeline:
                     )
                     template_std = np.std(transm_spec[wl_mask, 1])
                     if template_std > minimum_strength:
-                        # Calculate the cross-correlation
-                        # between data and template
-                        cross_corr, (opt_b, opt_a) = self.xcor_wavelength_solution(
-                            spec, wavel, transm_spec, accuracy, window_length, return_cross_corr=True
-                        )
+                    
+                        if sum_over_time:
+                            tot_flux = 0
+                            #Sum flux from all exposures
+                            for fits_file in fits_files:
+                                hdu_list2 = fits.open(fits_file)
+                                new_flux = hdu_list2[f"CHIP{i_det+1}.INT1"].data[spec_name + "_SPEC"]
+                                new_flux[np.isnan(new_flux)] = 0
+                                tot_flux += new_flux
+
+                            # Do cross-correlation on summed flux
+                            cross_corr, (opt_b, opt_a) = self.xcor_wavelength_solution(
+                                tot_flux, wavel, transm_spec, accuracy, window_length, return_cross_corr=True
+                            )
+                            
+                            # Save corrected wavelengths to all files for this order
+                            for save_file in fits_files:
+                                out_file = output_dir / (pathlib.Path(save_file).stem + "_corr.fits")
+                                if i_det==0 and order==0:
+                                    save_hdu_list = fits.open(save_file)
+                                else:
+                                    save_hdu_list = fits.open(out_file)
+                                mean_wavel = np.mean(wavel)
+                                try:
+                                    save_hdu_list[f"CHIP{i_det+1}.INT1"].data[spec_name + "_WL"] = (
+                                    opt_a * (wavel - mean_wavel) + mean_wavel + opt_b
+                                    )
+                                except:
+                                    print(save_hdu_list.info())
+                                    print(f'Error for {save_file}')
+
+                                save_hdu_list.writeto(out_file, overwrite=True)
+
+                        else:
+                            spec = hdu_list[f"CHIP{i_det+1}.INT1"].data[spec_name + "_SPEC"]
+
+                            # Calculate the cross-correlation
+                            # between data and template
+                            cross_corr, (opt_b, opt_a) = self.xcor_wavelength_solution(
+                                spec, wavel, transm_spec, accuracy, window_length, return_cross_corr=True
+                            )
 
                         # Plot correlation map
                         if create_plots:
@@ -4179,7 +4228,7 @@ class Pipeline:
                             plt.title(f"Detector {i_det+1}, order {order}")
                             plt.imshow(
                                 cross_corr,
-                                extent=[-0.5, 0.5, 0.98, 1.02],
+                                extent=[-0.3, 0.3, 0.98, 1.02],
                                 origin="lower",
                                 aspect="auto",
                             )
@@ -4205,17 +4254,12 @@ class Pipeline:
                         f"+ {opt_a:.4f} * lambda'"
                     )
 
-                    mean_wavel = np.mean(wavel)
-                    hdu_list[f"CHIP{i_det+1}.INT1"].data[spec_name + "_WL"] = (
-                        opt_a * (wavel - mean_wavel) + mean_wavel + opt_b
-                    )
-
             # Write the corrected spectra to a new FITS file
+            if not sum_over_time:
+                out_file = output_dir / (pathlib.Path(fits_file).stem + "_corr.fits")
+                print(f"\nStoring corrected spectra: {out_file}")
 
-            out_file = output_dir / (pathlib.Path(fits_file).stem + "_corr.fits")
-            print(f"\nStoring corrected spectra: {out_file}")
-
-            hdu_list.writeto(out_file, overwrite=True)
+                hdu_list.writeto(out_file, overwrite=True)
 
             # Save the correlation plots
             if create_plots:
